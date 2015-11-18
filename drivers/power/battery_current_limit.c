@@ -42,9 +42,6 @@
 #define BATTERY_VOLTAGE_MIN 3400
 #define BTM_8084_FREQ_MITIG_LIMIT 1958400
 
-static bool bcl_hotplug_enable = true;
-module_param(bcl_hotplug_enable, bool, 0644);
-
 #define BCL_FETCH_DT_U32(_dev, _key, _search_str, _ret, _out, _exit) do { \
 		_key = _search_str; \
 		_ret = of_property_read_u32(_dev, _key, &_out); \
@@ -475,7 +472,7 @@ static void bcl_iavail_work(struct work_struct *work)
 			struct bcl_context, bcl_iavail_work.work);
 
 	if (gbcl->bcl_mode == BCL_DEVICE_ENABLED) {
-		if (bcl_hotplug_enable) bcl_calculate_iavail_trigger();
+		bcl_calculate_iavail_trigger();
 		/* restart the delay work for caculating imax */
 		schedule_delayed_work(&bcl->bcl_iavail_work,
 			msecs_to_jiffies(bcl->bcl_poll_interval_msec));
