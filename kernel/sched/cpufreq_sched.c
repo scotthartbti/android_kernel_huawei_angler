@@ -14,7 +14,7 @@
 
 #include "sched.h"
 
-#define THROTTLE_NSEC		20000000 /* 50ms default */
+#define THROTTLE_NSEC		10000000 /* 20ms is the default value */
 
 static DEFINE_PER_CPU(unsigned long, pcpu_capacity);
 static DEFINE_PER_CPU(struct cpufreq_policy *, pcpu_policy);
