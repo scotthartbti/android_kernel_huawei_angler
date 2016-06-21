@@ -36,8 +36,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_interactive.h>
 
-extern bool mdss_screen_on;
-
 struct cpufreq_interactive_policyinfo {
 	struct timer_list policy_timer;
 	struct timer_list policy_slack_timer;
@@ -89,9 +87,6 @@ static unsigned int default_target_loads[] = {DEFAULT_TARGET_LOAD};
 #define DEFAULT_ABOVE_HISPEED_DELAY DEFAULT_TIMER_RATE
 static unsigned int default_above_hispeed_delay[] = {
 	DEFAULT_ABOVE_HISPEED_DELAY };
-
-#define DEFAULT_SCREEN_OFF_MAX 1555200
-static unsigned long screen_off_max = DEFAULT_SCREEN_OFF_MAX;
 
 struct cpufreq_interactive_tunables {
 	int usage_count;
@@ -152,6 +147,12 @@ struct cpufreq_interactive_tunables {
 	 * frequency.
 	 */
 	unsigned int max_freq_hysteresis;
+
+	/* Ignore hispeed_freq and above_hispeed_delay for notification */
+	bool ignore_hispeed_on_notif;
+
+	/* Ignore min_sample_time for notification */
+	bool fast_ramp_down;
 };
 
 /* For cases where we have single governor instance for system */
@@ -412,8 +413,7 @@ static u64 update_load(int cpu)
 	return now;
 }
 
-#define MAX_LOCAL_LOAD 100
-static void cpufreq_interactive_timer(unsigned long data)
+static void __cpufreq_interactive_timer(unsigned long data, bool is_notif)
 {
 	u64 now;
 	unsigned int delta_time;
@@ -430,6 +430,8 @@ static void cpufreq_interactive_timer(unsigned long data)
 	unsigned long max_cpu;
 	int i, fcpu;
 	struct cpufreq_govinfo govinfo;
+	bool skip_hispeed_logic, skip_min_sample_time;
+	bool policy_max_fast_restore = false;
 
 	if (!down_read_trylock(&ppol->enable_sem))
 		return;
@@ -492,9 +494,23 @@ static void cpufreq_interactive_timer(unsigned long data)
 	cpu_load = loadadjfreq / ppol->target_freq;
 	tunables->boosted = tunables->boost_val || now < tunables->boostpulse_endtime;
 
-	if (cpu_load >= tunables->go_hispeed_load || tunables->boosted) {
-		if (ppol->target_freq < tunables->hispeed_freq &&
-		    cpu_load <= MAX_LOCAL_LOAD) {
+	skip_hispeed_logic = tunables->ignore_hispeed_on_notif && is_notif;
+	skip_min_sample_time = tunables->fast_ramp_down && is_notif;
+	if (now - ppol->max_freq_hyst_start_time <
+	    tunables->max_freq_hysteresis &&
+	    cpu_load >= tunables->go_hispeed_load &&
+	    ppol->target_freq < ppol->policy->max) {
+		skip_hispeed_logic = true;
+		skip_min_sample_time = true;
+		policy_max_fast_restore = true;
+	}
+
+	if (policy_max_fast_restore) {
+		new_freq = ppol->policy->max;
+	} else if (skip_hispeed_logic) {
+		new_freq = choose_freq(ppol, loadadjfreq);
+	} else if (cpu_load >= tunables->go_hispeed_load || tunables->boosted) {
+		if (ppol->target_freq < tunables->hispeed_freq) {
 			new_freq = tunables->hispeed_freq;
 		} else {
 			new_freq = choose_freq(ppol, loadadjfreq);
@@ -504,9 +520,16 @@ static void cpufreq_interactive_timer(unsigned long data)
 		}
 	} else {
 		new_freq = choose_freq(ppol, loadadjfreq);
+		if (new_freq > tunables->hispeed_freq &&
+				ppol->policy->cur < tunables->hispeed_freq)
+			new_freq = tunables->hispeed_freq;
 	}
 
-	if (cpu_load <= MAX_LOCAL_LOAD &&
+	if (now - ppol->max_freq_hyst_start_time <
+	    tunables->max_freq_hysteresis)
+		new_freq = max(tunables->hispeed_freq, new_freq);
+
+	if (!skip_hispeed_logic &&
 	    ppol->target_freq >= tunables->hispeed_freq &&
 	    new_freq > ppol->target_freq &&
 	    now - ppol->hispeed_validate_time <
@@ -529,20 +552,11 @@ static void cpufreq_interactive_timer(unsigned long data)
 
 	new_freq = ppol->freq_table[index].frequency;
 
-	if (new_freq < ppol->target_freq &&
-	    now - ppol->max_freq_hyst_start_time <
-	    tunables->max_freq_hysteresis) {
-		trace_cpufreq_interactive_notyet(max_cpu, cpu_load,
-			ppol->target_freq, ppol->policy->cur, new_freq);
-		spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
-		goto rearm;
-	}
-
 	/*
 	 * Do not scale below floor_freq unless we have been at or above the
 	 * floor frequency for the minimum sample time since last validated.
 	 */
-	if (new_freq < ppol->floor_freq) {
+	if (!skip_min_sample_time && new_freq < ppol->floor_freq) {
 		if (now - ppol->floor_validate_time <
 				tunables->min_sample_time) {
 			trace_cpufreq_interactive_notyet(
@@ -558,18 +572,23 @@ static void cpufreq_interactive_timer(unsigned long data)
 	 * or above the selected frequency for a minimum of min_sample_time,
 	 * if not boosted to hispeed_freq.  If boosted to hispeed_freq then we
 	 * allow the speed to drop as soon as the boostpulse duration expires
-	 * (or the indefinite boost is turned off).
+	 * (or the indefinite boost is turned off). If policy->max is restored
+	 * for max_freq_hysteresis, don't extend the timestamp. Otherwise, it
+	 * could incorrectly extended the duration of max_freq_hysteresis by
+	 * min_sample_time.
 	 */
 
-	if (!tunables->boosted || new_freq > tunables->hispeed_freq) {
+	if ((!tunables->boosted || new_freq > tunables->hispeed_freq)
+	    && !policy_max_fast_restore) {
 		ppol->floor_freq = new_freq;
 		ppol->floor_validate_time = now;
 	}
 
-	if (new_freq == ppol->policy->max)
+	if (new_freq == ppol->policy->max && !policy_max_fast_restore)
 		ppol->max_freq_hyst_start_time = now;
 
-	if (ppol->target_freq == new_freq) {
+	if (ppol->target_freq == new_freq &&
+			ppol->target_freq <= ppol->policy->cur) {
 		trace_cpufreq_interactive_already(
 			max_cpu, cpu_load, ppol->target_freq,
 			ppol->policy->cur, new_freq);
@@ -585,7 +604,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	spin_lock_irqsave(&speedchange_cpumask_lock, flags);
 	cpumask_set_cpu(max_cpu, &speedchange_cpumask);
 	spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
-	wake_up_process(speedchange_task);
+	wake_up_process_no_notif(speedchange_task);
 
 rearm:
 	if (!timer_pending(&ppol->policy_timer))
@@ -596,6 +615,10 @@ exit:
 	return;
 }
 
+static void cpufreq_interactive_timer(unsigned long data)
+{
+	__cpufreq_interactive_timer(data, false);
+}
 
 static int cpufreq_interactive_speedchange_task(void *data)
 {
@@ -625,7 +648,6 @@ static int cpufreq_interactive_speedchange_task(void *data)
 		spin_unlock_irqrestore(&speedchange_cpumask_lock, flags);
 
 		for_each_cpu(cpu, &tmp_mask) {
-			unsigned int max_freq = 0;
 			ppol = per_cpu(polinfo, cpu);
 			if (!down_read_trylock(&ppol->enable_sem))
 				continue;
@@ -634,17 +656,12 @@ static int cpufreq_interactive_speedchange_task(void *data)
 				continue;
 			}
 
-			max_freq = ppol->target_freq;
-			if (unlikely(!mdss_screen_on))
-				if (ppol->target_freq > screen_off_max) 
-					max_freq = screen_off_max;
-
 			if (ppol->target_freq != ppol->policy->cur)
 				__cpufreq_driver_target(ppol->policy,
-							max_freq,
+							ppol->target_freq,
 							CPUFREQ_RELATION_H);
 			trace_cpufreq_interactive_setspeed(cpu,
-						     max_freq,
+						     ppol->target_freq,
 						     ppol->policy->cur);
 			up_read(&ppol->enable_sem);
 		}
@@ -692,7 +709,7 @@ static void cpufreq_interactive_boost(struct cpufreq_interactive_tunables *tunab
 	spin_unlock_irqrestore(&speedchange_cpumask_lock, flags[0]);
 
 	if (anyboost)
-		wake_up_process(speedchange_task);
+		wake_up_process_no_notif(speedchange_task);
 }
 
 static int load_change_callback(struct notifier_block *nb, unsigned long val,
@@ -722,7 +739,7 @@ static int load_change_callback(struct notifier_block *nb, unsigned long val,
 	trace_cpufreq_interactive_load_change(cpu);
 	del_timer(&ppol->policy_timer);
 	del_timer(&ppol->policy_slack_timer);
-	cpufreq_interactive_timer(cpu);
+	__cpufreq_interactive_timer(cpu, true);
 
 	up_read(&ppol->enable_sem);
 	return 0;
@@ -935,6 +952,8 @@ static ssize_t store_##file_name(					\
 }
 show_store_one(max_freq_hysteresis);
 show_store_one(align_windows);
+show_store_one(ignore_hispeed_on_notif);
+show_store_one(fast_ramp_down);
 
 static ssize_t show_go_hispeed_load(struct cpufreq_interactive_tunables
 		*tunables, char *buf)
@@ -1098,25 +1117,6 @@ static ssize_t store_boostpulse_duration(struct cpufreq_interactive_tunables
 		return ret;
 
 	tunables->boostpulse_duration_val = val;
-	return count;
-}
-
-static ssize_t show_screen_off_maxfreq(struct cpufreq_interactive_tunables *tunables,
-                char *buf)
-{
-	return sprintf(buf, "%lu\n", screen_off_max);
-}
-
-static ssize_t store_screen_off_maxfreq(struct cpufreq_interactive_tunables *tunables,
-                const char *buf, size_t count)
-{
-	int ret;
-	unsigned long val;
-
-	ret = strict_strtoul(buf, 0, &val);
-	if (ret < 0) return ret;
-	if (val < 384000) screen_off_max = DEFAULT_SCREEN_OFF_MAX;
-	else screen_off_max = val;
 	return count;
 }
 
@@ -1346,7 +1346,8 @@ show_store_gov_pol_sys(use_sched_load);
 show_store_gov_pol_sys(use_migration_notif);
 show_store_gov_pol_sys(max_freq_hysteresis);
 show_store_gov_pol_sys(align_windows);
-show_store_gov_pol_sys(screen_off_maxfreq);
+show_store_gov_pol_sys(ignore_hispeed_on_notif);
+show_store_gov_pol_sys(fast_ramp_down);
 
 #define gov_sys_attr_rw(_name)						\
 static struct global_attr _name##_gov_sys =				\
@@ -1374,7 +1375,8 @@ gov_sys_pol_attr_rw(use_sched_load);
 gov_sys_pol_attr_rw(use_migration_notif);
 gov_sys_pol_attr_rw(max_freq_hysteresis);
 gov_sys_pol_attr_rw(align_windows);
-gov_sys_pol_attr_rw(screen_off_maxfreq);
+gov_sys_pol_attr_rw(ignore_hispeed_on_notif);
+gov_sys_pol_attr_rw(fast_ramp_down);
 
 static struct global_attr boostpulse_gov_sys =
 	__ATTR(boostpulse, 0200, NULL, store_boostpulse_gov_sys);
@@ -1399,7 +1401,8 @@ static struct attribute *interactive_attributes_gov_sys[] = {
 	&use_migration_notif_gov_sys.attr,
 	&max_freq_hysteresis_gov_sys.attr,
 	&align_windows_gov_sys.attr,
-	&screen_off_maxfreq_gov_sys.attr,
+	&ignore_hispeed_on_notif_gov_sys.attr,
+	&fast_ramp_down_gov_sys.attr,
 	NULL,
 };
 
@@ -1425,7 +1428,8 @@ static struct attribute *interactive_attributes_gov_pol[] = {
 	&use_migration_notif_gov_pol.attr,
 	&max_freq_hysteresis_gov_pol.attr,
 	&align_windows_gov_pol.attr,
-	&screen_off_maxfreq_gov_pol.attr,
+	&ignore_hispeed_on_notif_gov_pol.attr,
+	&fast_ramp_down_gov_pol.attr,
 	NULL,
 };
 
@@ -1712,8 +1716,6 @@ static int __init cpufreq_interactive_init(void)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 
-	mdss_screen_on = true;
-
 	spin_lock_init(&speedchange_cpumask_lock);
 	mutex_init(&gov_lock);
 	mutex_init(&sched_lock);
@@ -1727,7 +1729,7 @@ static int __init cpufreq_interactive_init(void)
 	get_task_struct(speedchange_task);
 
 	/* NB: wake up so the thread does not look hung to the freezer */
-	wake_up_process(speedchange_task);
+	wake_up_process_no_notif(speedchange_task);
 
 	return cpufreq_register_governor(&cpufreq_gov_interactive);
 }
