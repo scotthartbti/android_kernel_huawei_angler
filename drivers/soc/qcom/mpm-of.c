@@ -134,7 +134,7 @@ enum {
 	MSM_MPM_DEBUG_NON_DETECTABLE_IRQ_IDLE = BIT(3),
 };
 
-static int msm_mpm_debug_mask = 1;
+static int msm_mpm_debug_mask = 0;
 module_param_named(
 	debug_mask, msm_mpm_debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP
 );
@@ -545,6 +545,8 @@ void msm_mpm_enter_sleep(uint32_t sclk_count, bool from_idle,
 		wakeup = (~0ULL);
 	}
 
+	msm_mpm_gpio_irqs_detectable(from_idle);
+	msm_mpm_irqs_detectable(from_idle);
 	msm_mpm_set(wakeup, !from_idle);
 	if (cpumask)
 		irq_set_affinity(msm_mpm_dev_data.mpm_ipc_irq, cpumask);
@@ -653,7 +655,7 @@ static void msm_mpm_work_fn(struct work_struct *work)
 	unsigned long flags;
 	while (1) {
 		bool allow;
-		wait_for_completion(&wake_wq);
+		wait_for_completion_interruptible(&wake_wq);
 		spin_lock_irqsave(&msm_mpm_lock, flags);
 		allow = msm_mpm_irqs_detectable(true) &&
 				msm_mpm_gpio_irqs_detectable(true);
@@ -687,10 +689,11 @@ static int msm_mpm_dev_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	xo_clk = devm_clk_get(&pdev->dev, clk_name);
+	xo_clk = clk_get(&pdev->dev, clk_name);
 
 	if (IS_ERR(xo_clk)) {
-		pr_err("%s(): Cannot get clk resource for XO\n", __func__);
+		pr_err("%s(): Cannot get clk resource for XO: %ld\n", __func__,
+				PTR_ERR(xo_clk));
 		return PTR_ERR(xo_clk);
 	}
 

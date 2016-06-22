@@ -34,11 +34,26 @@
 #include <linux/pm_runtime.h>
 #include <linux/kernel.h>
 #include <linux/gpio.h>
+#include <linux/sound_control.h>
 #include "wcd9330.h"
 #include "wcd9xxx-resmgr.h"
 #include "wcd9xxx-common.h"
 #include "wcdcal-hwdep.h"
 #include "wcd_cpe_core.h"
+
+struct sound_control {
+	struct snd_soc_codec *snd_control_codec;
+	int default_hp_value;
+	int default_mic_value;
+	int default_camera_mic_value;
+	bool hp_lock;
+	bool mic_lock;
+	bool camera_mic_lock;
+} soundcontrol = {
+	.hp_lock = false,
+	.mic_lock = false,
+	.camera_mic_lock = false,
+};
 
 enum {
 	VI_SENSE_1,
@@ -51,6 +66,7 @@ enum {
 	ADC4_TXFE,
 	ADC5_TXFE,
 	ADC6_TXFE,
+	HPH_DELAY,
 };
 
 #define TOMTOM_MAD_SLIMBUS_TX_PORT 12
@@ -61,7 +77,7 @@ enum {
 #define TOMTOM_BIT_ADJ_SHIFT_PORT1_6 4
 #define TOMTOM_BIT_ADJ_SHIFT_PORT7_10 5
 
-#define TOMTOM_HPH_PA_SETTLE_COMP_ON 5000
+#define TOMTOM_HPH_PA_SETTLE_COMP_ON 10000
 #define TOMTOM_HPH_PA_SETTLE_COMP_OFF 13000
 #define TOMTOM_HPH_PA_RAMP_DELAY 30000
 
@@ -1126,15 +1142,21 @@ static int tomtom_config_compander(struct snd_soc_dapm_widget *w,
 	pr_debug("%s: %s event %d compander %d, enabled %d", __func__,
 		 w->name, event, comp, tomtom->comp_enabled[comp]);
 
+	if (!tomtom->comp_enabled[comp])
+		return 0;
+
 	/* Compander 0 has two channels */
 	mask = enable_mask = 0x03;
 	buck_mv = tomtom_codec_get_buck_mv(codec);
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
-		if (!tomtom->comp_enabled[comp])
+		/* If EAR PA is enabled then compander should not be enabled */
+		if ((snd_soc_read(codec, TOMTOM_A_RX_EAR_EN) & 0x10) != 0) {
+			pr_debug("%s: EAR is enabled, do not enable compander\n",
+				 __func__);
 			break;
-
+		}
 		/* Set compander Sample rate */
 		snd_soc_update_bits(codec,
 				    TOMTOM_A_CDC_COMP0_FS_CFG + (comp * 8),
@@ -4303,14 +4325,22 @@ static int tomtom_hph_pa_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		set_bit(HPH_DELAY, &tomtom->status_mask);
 		/* Let MBHC module know PA is turning on */
 		wcd9xxx_resmgr_notifier_call(&tomtom->resmgr, e_pre_on);
 		break;
 
 	case SND_SOC_DAPM_POST_PMU:
-		usleep_range(pa_settle_time, pa_settle_time + 1000);
-		pr_debug("%s: sleep %d us after %s PA enable\n", __func__,
-				pa_settle_time, w->name);
+		if (test_bit(HPH_DELAY, &tomtom->status_mask)) {
+			/*
+			 * Make sure to wait 10ms after enabling HPHR_HPHL
+			 * in register 0x1AB
+			*/
+			usleep_range(pa_settle_time, pa_settle_time + 1000);
+			clear_bit(HPH_DELAY, &tomtom->status_mask);
+			pr_debug("%s: sleep %d us after %s PA enable\n",
+				__func__, pa_settle_time, w->name);
+		}
 		if (!high_perf_mode && !tomtom->uhqa_mode) {
 			wcd9xxx_clsh_fsm(codec, &tomtom->clsh_d,
 						 req_clsh_state,
@@ -4319,12 +4349,23 @@ static int tomtom_hph_pa_event(struct snd_soc_dapm_widget *w,
 		}
 		break;
 
+	case SND_SOC_DAPM_PRE_PMD:
+		set_bit(HPH_DELAY, &tomtom->status_mask);
+		break;
+
 	case SND_SOC_DAPM_POST_PMD:
 		/* Let MBHC module know PA turned off */
 		wcd9xxx_resmgr_notifier_call(&tomtom->resmgr, e_post_off);
-		usleep_range(pa_settle_time, pa_settle_time + 1000);
-		pr_debug("%s: sleep %d us after %s PA disable\n", __func__,
-				pa_settle_time, w->name);
+		if (test_bit(HPH_DELAY, &tomtom->status_mask)) {
+			/*
+			 * Make sure to wait 10ms after disabling HPHR_HPHL
+			 * in register 0x1AB
+			*/
+			usleep_range(pa_settle_time, pa_settle_time + 1000);
+			clear_bit(HPH_DELAY, &tomtom->status_mask);
+			pr_debug("%s: sleep %d us after %s PA disable\n",
+				__func__, pa_settle_time, w->name);
+		}
 
 		break;
 	}
@@ -4610,7 +4651,6 @@ static const struct snd_soc_dapm_route audio_map[] = {
 	{"HPHL", NULL, "HPHL_PA_MIXER"},
 	{"HPHL_PA_MIXER", NULL, "HPHL DAC"},
 	{"HPHL DAC", NULL, "RX_BIAS"},
-	{"HPHL DAC", NULL, "COMP1_CLK"},
 
 	{"HPHR", NULL, "HPHR_PA_MIXER"},
 	{"HPHR_PA_MIXER", NULL, "HPHR DAC"},
@@ -4712,6 +4752,7 @@ static const struct snd_soc_dapm_route audio_map[] = {
 
 	{"RX7 MIX1", NULL, "COMP0_CLK"},
 	{"RX8 MIX1", NULL, "COMP0_CLK"},
+	{"RX1 MIX1", NULL, "COMP1_CLK"},
 	{"RX2 MIX1", NULL, "COMP1_CLK"},
 	{"RX3 MIX1", NULL, "COMP2_CLK"},
 	{"RX5 MIX1", NULL, "COMP2_CLK"},
@@ -5272,9 +5313,33 @@ static int tomtom_volatile(struct snd_soc_codec *ssc, unsigned int reg)
 	return 0;
 }
 
+static int reg_access(unsigned int reg)
+{
+	int ret = 1;
+
+	switch (reg) {
+		case TOMTOM_A_CDC_RX1_VOL_CTL_B2_CTL:
+		case TOMTOM_A_CDC_RX2_VOL_CTL_B2_CTL:
+			if (soundcontrol.hp_lock)
+                                ret = 0;
+                        break;
+		case TOMTOM_A_CDC_TX6_VOL_CTL_GAIN:
+			if (soundcontrol.mic_lock)
+				ret = 0;
+			break;
+		case TOMTOM_A_CDC_TX4_VOL_CTL_GAIN:
+			if (soundcontrol.camera_mic_lock)
+				ret = 0;
+			break;
+	}
+
+	return ret;
+}
+
 static int tomtom_write(struct snd_soc_codec *codec, unsigned int reg,
 	unsigned int value)
 {
+	int val;
 	int ret;
 	struct wcd9xxx *wcd9xxx = codec->control_data;
 	struct tomtom_priv *tomtom_p = snd_soc_codec_get_drvdata(codec);
@@ -5294,9 +5359,16 @@ static int tomtom_write(struct snd_soc_codec *codec, unsigned int reg,
 	if (unlikely(test_bit(BUS_DOWN, &tomtom_p->status_mask))) {
 		dev_err(codec->dev, "write 0x%02x while offline\n", reg);
 		return -ENODEV;
-	} else
-		return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, value);
+	} else {
+		if (!reg_access(reg))
+			val = wcd9xxx_reg_read(&wcd9xxx->core_res, reg);
+		else
+			val = value;
+
+		return wcd9xxx_reg_write(&wcd9xxx->core_res, reg, val);
+	}
 }
+
 static unsigned int tomtom_read(struct snd_soc_codec *codec,
 				unsigned int reg)
 {
@@ -6549,6 +6621,21 @@ static int tomtom_codec_ear_dac_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
+		/*
+		 * When EAR is enabled, compander (1) in HPH path should be
+		 * disabled, and gain source for HPH set to register
+		 */
+		if ((snd_soc_read(codec, TOMTOM_A_CDC_COMP1_B1_CTL) &
+				  0x03) != 0) {
+			pr_debug("%s: Disabling COMP1\n", __func__);
+			snd_soc_update_bits(codec, TOMTOM_A_RX_HPH_L_GAIN,
+						0x20, 0x20);
+			snd_soc_update_bits(codec, TOMTOM_A_RX_HPH_R_GAIN,
+						0x20, 0x20);
+			snd_soc_update_bits(codec, TOMTOM_A_CDC_COMP1_B1_CTL,
+						0x03, 0x00);
+		}
+
 		wcd9xxx_clsh_fsm(codec, &tomtom_p->clsh_d,
 						 WCD9XXX_CLSH_STATE_EAR,
 						 WCD9XXX_CLSH_REQ_ENABLE,
@@ -6721,7 +6808,8 @@ static const struct snd_soc_dapm_widget tomtom_dapm_widgets[] = {
 	SND_SOC_DAPM_OUTPUT("HEADPHONE"),
 	SND_SOC_DAPM_PGA_E("HPHL", TOMTOM_A_RX_HPH_CNP_EN, 5, 0, NULL, 0,
 		tomtom_hph_pa_event, SND_SOC_DAPM_PRE_PMU |
-		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
+		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD |
+		SND_SOC_DAPM_POST_PMD),
 	SND_SOC_DAPM_MIXER_E("HPHL DAC", TOMTOM_A_RX_HPH_L_DAC_CTL, 7, 0,
 		hphl_switch, ARRAY_SIZE(hphl_switch), tomtom_hphl_dac_event,
 		SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
@@ -6729,7 +6817,8 @@ static const struct snd_soc_dapm_widget tomtom_dapm_widgets[] = {
 
 	SND_SOC_DAPM_PGA_E("HPHR", TOMTOM_A_RX_HPH_CNP_EN, 4, 0, NULL, 0,
 		tomtom_hph_pa_event, SND_SOC_DAPM_PRE_PMU |
-		SND_SOC_DAPM_POST_PMU |	SND_SOC_DAPM_POST_PMD),
+		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD |
+		SND_SOC_DAPM_POST_PMD),
 
 	SND_SOC_DAPM_DAC_E("HPHR DAC", NULL, TOMTOM_A_RX_HPH_R_DAC_CTL, 7, 0,
 		tomtom_hphr_dac_event,
@@ -8725,6 +8814,63 @@ static int tomtom_cpe_initialize(struct snd_soc_codec *codec)
 	return 0;
 }
 
+void update_headphones_volume_boost(unsigned int vol_boost)
+{
+	int default_val = soundcontrol.default_hp_value;
+	int boosted_val = default_val + vol_boost;
+
+	pr_info("Sound Control: Headphones default value %d\n", default_val);
+
+	soundcontrol.hp_lock = false;
+	tomtom_write(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_RX1_VOL_CTL_B2_CTL, boosted_val);
+	tomtom_write(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_RX2_VOL_CTL_B2_CTL, boosted_val);
+	soundcontrol.hp_lock = true;
+
+	pr_info("Sound Control: Boosted Headphones RX1 value %d\n",
+		tomtom_read(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_RX1_VOL_CTL_B2_CTL));
+
+	pr_info("Sound Control: Boosted Headphones RX2 value %d\n",
+		tomtom_read(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_RX2_VOL_CTL_B2_CTL));
+}
+
+void update_mic_gain(unsigned int vol_boost)
+{
+	int default_val = soundcontrol.default_mic_value;
+	int boosted_val = default_val + vol_boost;
+
+	pr_info("Sound Control: Mic default value %d\n", default_val);
+
+	soundcontrol.mic_lock = false;
+	tomtom_write(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_TX6_VOL_CTL_GAIN, boosted_val);
+	soundcontrol.mic_lock = true;
+
+	pr_info("Sound Control: Boosted Mic value %d\n",
+		tomtom_read(soundcontrol.snd_control_codec,
+		TOMTOM_A_CDC_TX6_VOL_CTL_GAIN));
+}
+
+void update_camera_mic_gain(unsigned int vol_boost)
+{
+        int default_val = soundcontrol.default_camera_mic_value;
+        int boosted_val = default_val + vol_boost;
+
+	pr_info("Sound Control: Camera mic default value %d\n", default_val);
+
+        soundcontrol.camera_mic_lock = false;
+        	tomtom_write(soundcontrol.snd_control_codec,
+                TOMTOM_A_CDC_TX4_VOL_CTL_GAIN, boosted_val);
+        soundcontrol.camera_mic_lock = true;
+
+        pr_info("Sound Control: Boosted Camera mic value %d\n",
+                tomtom_read(soundcontrol.snd_control_codec,
+                TOMTOM_A_CDC_TX4_VOL_CTL_GAIN));
+}
+
 static int tomtom_codec_probe(struct snd_soc_codec *codec)
 {
 	struct wcd9xxx *control;
@@ -8736,6 +8882,8 @@ static int tomtom_codec_probe(struct snd_soc_codec *codec)
 	int i, rco_clk_rate;
 	void *ptr = NULL;
 	struct wcd9xxx_core_resource *core_res;
+
+	soundcontrol.snd_control_codec = codec;
 
 	codec->control_data = dev_get_drvdata(codec->dev->parent);
 	control = codec->control_data;
@@ -8910,6 +9058,17 @@ static int tomtom_codec_probe(struct snd_soc_codec *codec)
 		/* Do not fail probe if CPE failed */
 		ret = 0;
 	}
+
+	/*
+	 * Get the default values during probe
+	 */
+	soundcontrol.default_hp_value = tomtom_read(codec,
+		TOMTOM_A_CDC_RX1_VOL_CTL_B2_CTL);
+	soundcontrol.default_mic_value = tomtom_read(codec,
+		TOMTOM_A_CDC_TX6_VOL_CTL_GAIN);
+	soundcontrol.default_camera_mic_value = tomtom_read(codec,
+                TOMTOM_A_CDC_TX4_VOL_CTL_GAIN);
+
 	return ret;
 
 err_pdata:

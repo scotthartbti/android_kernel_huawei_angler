@@ -2698,7 +2698,7 @@ static int __mem_cgroup_try_charge(struct mm_struct *mm,
 	 * in system level. So, allow to go ahead dying process in addition to
 	 * MEMDIE process.
 	 */
-	if (unlikely(test_thread_flag(TIF_MEMDIE)
+	if (unlikely(test_thread_flag_relaxed(TIF_MEMDIE)
 		     || fatal_signal_pending(current)))
 		goto bypass;
 
@@ -4095,7 +4095,7 @@ static void mem_cgroup_do_uncharge(struct mem_cgroup *memcg,
 	 * because we want to do uncharge as soon as possible.
 	 */
 
-	if (!batch->do_batch || test_thread_flag(TIF_MEMDIE))
+	if (!batch->do_batch || test_thread_flag_relaxed(TIF_MEMDIE))
 		goto direct_uncharge;
 
 	if (nr_pages > 1)
@@ -4658,8 +4658,10 @@ static int mem_cgroup_resize_limit(struct mem_cgroup *memcg,
 		}
 		mutex_unlock(&set_limit_mutex);
 
-		if (!ret)
+		if (!ret) {
+			vmpressure_update_mem_limit(memcg, val);
 			break;
+		}
 
 		mem_cgroup_reclaim(memcg, GFP_KERNEL,
 				   MEM_CGROUP_RECLAIM_SHRINK);
@@ -5790,16 +5792,17 @@ static void mem_cgroup_usage_unregister_event(struct cgroup *cgrp,
 swap_buffers:
 	/* Swap primary and spare array */
 	thresholds->spare = thresholds->primary;
-	/* If all events are unregistered, free the spare array */
-	if (!new) {
-		kfree(thresholds->spare);
-		thresholds->spare = NULL;
-	}
 
 	rcu_assign_pointer(thresholds->primary, new);
 
 	/* To be sure that nobody uses thresholds */
 	synchronize_rcu();
+
+	/* If all events are unregistered, free the spare array */
+	if (!new) {
+		kfree(thresholds->spare);
+		thresholds->spare = NULL;
+	}
 unlock:
 	mutex_unlock(&memcg->thresholds_lock);
 }
@@ -6281,7 +6284,7 @@ mem_cgroup_css_alloc(struct cgroup *cont)
 	memcg->move_charge_at_immigrate = 0;
 	mutex_init(&memcg->thresholds_lock);
 	spin_lock_init(&memcg->move_lock);
-	vmpressure_init(&memcg->vmpressure);
+	vmpressure_init(&memcg->vmpressure, cont->parent == NULL);
 
 	return &memcg->css;
 
@@ -6795,6 +6798,12 @@ static int mem_cgroup_can_attach(struct cgroup *cgroup,
 	return ret;
 }
 
+static int mem_cgroup_allow_attach(struct cgroup *cgroup,
+				   struct cgroup_taskset *tset)
+{
+	return subsys_cgroup_allow_attach(cgroup, tset);
+}
+
 static void mem_cgroup_cancel_attach(struct cgroup *cgroup,
 				     struct cgroup_taskset *tset)
 {
@@ -6960,6 +6969,11 @@ static void mem_cgroup_move_task(struct cgroup *cont,
 #else	/* !CONFIG_MMU */
 static int mem_cgroup_can_attach(struct cgroup *cgroup,
 				 struct cgroup_taskset *tset)
+{
+	return 0;
+}
+static int mem_cgroup_allow_attach(struct cgroup *cgroup,
+				   struct cgroup_taskset *tset)
 {
 	return 0;
 }

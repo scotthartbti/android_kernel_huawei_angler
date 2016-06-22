@@ -1589,7 +1589,6 @@ int _ipa_init_sram_v2(void)
 	IPA_SRAM_SET(IPA_MEM_PART(v6_rt_ofst), IPA_MEM_CANARY_VAL);
 	IPA_SRAM_SET(IPA_MEM_PART(modem_hdr_ofst), IPA_MEM_CANARY_VAL);
 	IPA_SRAM_SET(IPA_MEM_PART(modem_ofst), IPA_MEM_CANARY_VAL);
-	IPA_SRAM_SET(IPA_MEM_PART(apps_v4_flt_ofst), IPA_MEM_CANARY_VAL);
 	IPA_SRAM_SET(IPA_MEM_PART(uc_info_ofst), IPA_MEM_CANARY_VAL);
 
 	iounmap(ipa_sram_mmio);
@@ -3356,15 +3355,6 @@ static int ipa_init(const struct ipa_plat_drv_res *resource_p,
 		IPAERR("unable to create nat device\n");
 		result = -ENODEV;
 		goto fail_nat_dev_add;
-	}
-
-	/* Create workqueue for power management */
-	ipa_ctx->power_mgmt_wq =
-		create_singlethread_workqueue("ipa_power_mgmt");
-	if (!ipa_ctx->power_mgmt_wq) {
-		IPAERR("failed to create wq\n");
-		result = -ENOMEM;
-		goto fail_init_hw;
 	}
 
 	/* Create a wakeup source. */

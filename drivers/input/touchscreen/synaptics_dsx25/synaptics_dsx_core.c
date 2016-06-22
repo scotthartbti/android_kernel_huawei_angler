@@ -24,6 +24,7 @@
 #include <linux/input.h>
 #include <linux/gpio.h>
 #include <linux/platform_device.h>
+#include <linux/qpnp/qpnp-haptic.h>
 #include <linux/regulator/consumer.h>
 #include "synaptics_dsx.h"
 #include "synaptics_dsx_core.h"
@@ -100,6 +101,11 @@
 
 #define DSX_VBUS_VTG_MIN_VN1 1850000
 #define DSX_VBUS_VTG_MAX_VN1 1850000
+
+#define VIBRATE_STRENGTH 20
+
+static bool wakeup_gesture_changed = false;
+static bool wakeup_gesture_temp;
 
 static int synaptics_rmi4_f12_set_enables(struct synaptics_rmi4_data *rmi4_data,
 		unsigned short ctrl28);
@@ -724,17 +730,16 @@ static ssize_t synaptics_rmi4_wake_gesture_store(struct device *dev,
 	if (sscanf(buf, "%u", &input) != 1)
 		return -EINVAL;
 
-	if (rmi4_data->suspend) {
-		dev_err(rmi4_data->pdev->dev.parent,
-				"%s:Wake_gesture can not operate when the system is suspended\n",
-				__func__);
-		return -EINVAL;
-	}
-
 	input = input > 0 ? 1 : 0;
 
-	if (rmi4_data->f11_wakeup_gesture || rmi4_data->f12_wakeup_gesture)
-		rmi4_data->enable_wakeup_gesture = input;
+	if (rmi4_data->f11_wakeup_gesture || rmi4_data->f12_wakeup_gesture) {
+		if (rmi4_data->suspend) { 
+			wakeup_gesture_changed = true;
+			wakeup_gesture_temp = input;
+		} else {
+			rmi4_data->enable_wakeup_gesture = input;
+		}
+	}
 
 	return count;
 }
@@ -965,6 +970,7 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 		}
 		if(rmi4_data->gesture_sleep && detected_gestures) {
 			tp_log_debug("%s:gesture detected!\n", __func__);
+			vibrate(VIBRATE_STRENGTH);
 			wake_lock_timeout(&rmi4_data->rmi4_wake_lock, 5*HZ);
 			input_report_key(rmi4_data->input_dev, KEY_WAKEUP, 1);
 			input_sync(rmi4_data->input_dev);
@@ -3813,7 +3819,7 @@ static void synaptics_rmi4_f12_wg(struct synaptics_rmi4_data *rmi4_data,
 		rmi4_data->gesture_sleep = false;
 		disable_irq_wake(rmi4_data->irq);
 		dev_info(rmi4_data->pdev->dev.parent,
-				"%s: exist gesture mode\n", __func__);
+				"%s: exist gesture mode\n",	__func__);
 	}
 
 	return;
@@ -4103,6 +4109,11 @@ static int synaptics_rmi4_resume(struct device *dev)
 
 exit:
 	rmi4_data->suspend = false;
+
+	if (wakeup_gesture_changed) {
+		rmi4_data->enable_wakeup_gesture = wakeup_gesture_temp;
+		wakeup_gesture_changed = false;
+	}
 
 	return 0;
 }
