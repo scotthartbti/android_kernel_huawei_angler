@@ -62,6 +62,7 @@ modules.builtin
 include/config
 include/generated
 arch/*/include/generated
+kernel/x509_certificate_list
 
 # stgit generated dirs
 patches-*
