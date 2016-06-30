@@ -671,7 +671,6 @@ static int lpm_cpuidle_select(struct cpuidle_driver *drv,
 	if (idx < 0)
 		return -EPERM;
 
-	trace_cpu_idle_rcuidle(idx, dev->cpu);
 	return idx;
 }
 
@@ -684,11 +683,6 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 	int64_t start_time = ktime_to_ns(ktime_get()), end_time;
 	struct power_params *pwr_params;
 
-	if (need_resched()) {
-		dev->last_residency = 0;
-		goto exit;
-	}
-
 	pwr_params = &cluster->cpu->levels[idx].pwr;
 	sched_set_cpu_cstate(smp_processor_id(), idx + 1,
 		pwr_params->energy_overhead, pwr_params->latency_us);
@@ -700,6 +694,9 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 	trace_cpu_idle_enter(idx);
 	lpm_stats_cpu_enter(idx);
 
+	if (need_resched() || (idx < 0))
+		goto exit;
+
 	if (idx > 0)
 		update_debug_pc_event(CPU_ENTER, idx, 0xdeaffeed, 0xdeaffeed,
 					true);
@@ -709,15 +706,13 @@ static int lpm_cpuidle_enter(struct cpuidle_device *dev,
 		update_debug_pc_event(CPU_EXIT, idx, success, 0xdeaffeed,
 					true);
 
+exit:
 	lpm_stats_cpu_exit(idx, success);
 	cluster_unprepare(cluster, cpumask, idx, true);
 	cpu_unprepare(cluster, idx, true);
 
 	sched_set_cpu_cstate(smp_processor_id(), 0, 0, 0);
 	trace_cpu_idle_exit(idx, success);
-
-exit:
-	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, dev->cpu);
 	end_time = ktime_to_ns(ktime_get()) - start_time;
 	dev->last_residency = do_div(end_time, 1000);
 	local_irq_enable();
@@ -726,7 +721,6 @@ exit:
 }
 
 #ifdef CONFIG_CPU_IDLE_MULTIPLE_DRIVERS
-static DEFINE_PER_CPU(struct cpuidle_device, cpuidle_dev);
 static int cpuidle_register_cpu(struct cpuidle_driver *drv,
 		struct cpumask *mask)
 {
@@ -737,12 +731,14 @@ static int cpuidle_register_cpu(struct cpuidle_driver *drv,
 	if (!mask || !drv)
 		return -EINVAL;
 
+	drv->cpumask = mask;
+	ret = cpuidle_register_driver(drv);
+	if (ret) {
+		pr_err("Failed to register cpuidle driver %d\n", ret);
+		goto failed_driver_register;
+	}
+
 	for_each_cpu(cpu, mask) {
-		ret = cpuidle_register_cpu_driver(drv, cpu);
-		if (ret) {
-			pr_err("Failed to register cpuidle driver %d\n", ret);
-			goto failed_driver_register;
-		}
 		device = &per_cpu(cpuidle_dev, cpu);
 		device->cpu = cpu;
 
@@ -756,7 +752,7 @@ static int cpuidle_register_cpu(struct cpuidle_driver *drv,
 	return ret;
 failed_driver_register:
 	for_each_cpu(cpu, mask)
-		cpuidle_unregister_cpu_driver(drv, cpu);
+		cpuidle_unregister_driver(drv);
 	return ret;
 }
 #else
